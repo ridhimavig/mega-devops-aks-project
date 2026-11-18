@@ -1,0 +1,13 @@
+{
+  "name": "mega-devops-app",
+  "version": "1.0.0",
+  "description": "Cloud-native demo microservice for AKS DevOps pipeline",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "prom-client": "^15.1.3"
+  }
+}
