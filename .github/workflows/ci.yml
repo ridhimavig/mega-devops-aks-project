@@ -1,0 +1,88 @@
+name: CI - Build, Scan & Push to GHCR
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'app/**'
+      - '.github/workflows/ci.yml'
+      - 'sonar-project.properties'
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/mega-devops-app
+
+jobs:
+  code-quality-and-sast:
+    name: SonarQube Cloud & Trivy FS Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SonarQube Cloud Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Trivy Filesystem Security Scan
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            aquasec/trivy:latest fs /workspace/app \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 1
+
+  build-scan-and-push:
+    name: Build, Trivy Image Scan & Push
+    needs: code-quality-and-sast
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set lowercase image tag
+        id: meta
+        run: |
+          IMAGE_LOWER=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "image=$IMAGE_LOWER" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha }} \
+            -t ${{ steps.meta.outputs.image }}:latest \
+            ./app
+
+      - name: Trivy Container Image Security Scan
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image \
+            --severity CRITICAL \
+            --ignore-unfixed \
+            --exit-code 1 \
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha }}
+
+      - name: Push Docker image to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha }}
+          docker push ${{ steps.meta.outputs.image }}:latest
