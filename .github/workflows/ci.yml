@@ -1,21 +1,23 @@
-name: CI - Build, Scan & Push to GHCR
+name: CI/CD - 3-Branch GitOps Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, stage, prod ]
     paths:
       - 'app/**'
       - '.github/workflows/ci.yml'
       - 'sonar-project.properties'
   pull_request:
-    branches: [ main ]
+    branches: [ main, stage, prod ]
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/mega-devops-app
 
 jobs:
-  code-quality-and-sast:
+  # Runs on main, stage, and prod (validation-only on main)
+  validate-and-scan:
     name: SonarQube Cloud & Trivy FS Scan
     runs-on: ubuntu-latest
     steps:
@@ -38,51 +40,89 @@ jobs:
             --ignore-unfixed \
             --exit-code 1
 
-  build-scan-and-push:
-    name: Build, Trivy Image Scan & Push
-    needs: code-quality-and-sast
+  # Runs ONLY on stage branch (auto-updates stage GitOps manifest)
+  deploy-stage:
+    name: Build, Scan & Update Stage Manifest
+    needs: validate-and-scan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/stage'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
-      - name: Checkout repository
+      - name: Checkout stage branch
         uses: actions/checkout@v4
+        with:
+          ref: stage
 
-      - name: Log in to GitHub Container Registry (GHCR)
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set lowercase image tag
-        id: meta
+      - name: Build, Trivy Scan & Push Stage Image
+        id: build
         run: |
           IMAGE_LOWER=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          echo "image=$IMAGE_LOWER" >> "$GITHUB_OUTPUT"
-          echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          TAG="stage-$(git rev-parse --short HEAD)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Build Docker image
-        run: |
-          docker build \
-            -t ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha }} \
-            -t ${{ steps.meta.outputs.image }}:latest \
-            ./app
+          docker build -t "${IMAGE_LOWER}:${TAG}" ./app
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image --severity CRITICAL --ignore-unfixed --exit-code 1 "${IMAGE_LOWER}:${TAG}"
+          docker push "${IMAGE_LOWER}:${TAG}"
 
-      - name: Trivy Container Image Security Scan
+      - name: Update Kustomize stage image tag (GitOps)
         run: |
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            aquasec/trivy:latest image \
-            --severity CRITICAL \
-            --ignore-unfixed \
-            --exit-code 1 \
-            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha }}
+          sed -i "s|newTag: .*|newTag: ${{ steps.build.outputs.tag }}|" kubernetes/overlays/stage/kustomization.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add kubernetes/overlays/stage/kustomization.yaml
+          git commit -m "chore(stage): bump image tag to ${{ steps.build.outputs.tag }} [skip ci]"
+          git push origin stage
 
-      - name: Push Docker image to GHCR
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  # Runs ONLY on prod branch (pauses for Manual Approval first)
+  deploy-prod:
+    name: Approve, Build & Update Prod Manifest
+    needs: validate-and-scan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/prod'
+    environment: production
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout prod branch
+        uses: actions/checkout@v4
+        with:
+          ref: prod
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build, Trivy Scan & Push Prod Image
+        id: build
         run: |
-          docker push ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha }}
-          docker push ${{ steps.meta.outputs.image }}:latest
+          IMAGE_LOWER=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          TAG="prod-$(git rev-parse --short HEAD)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          docker build -t "${IMAGE_LOWER}:${TAG}" ./app
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image --severity CRITICAL --ignore-unfixed --exit-code 1 "${IMAGE_LOWER}:${TAG}"
+          docker push "${IMAGE_LOWER}:${TAG}"
+
+      - name: Update Kustomize prod image tag (GitOps)
+        run: |
+          sed -i "s|newTag: .*|newTag: ${{ steps.build.outputs.tag }}|" kubernetes/overlays/prod/kustomization.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add kubernetes/overlays/prod/kustomization.yaml
+          git commit -m "chore(prod): bump image tag to ${{ steps.build.outputs.tag }} [skip ci]"
+          git push origin prod

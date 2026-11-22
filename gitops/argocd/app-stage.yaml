@@ -9,7 +9,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/ridhimavig/mega-devops-aks-project.git
-    targetRevision: main
+    targetRevision: stage
     path: kubernetes/overlays/stage
   destination:
     server: https://kubernetes.default.svc
